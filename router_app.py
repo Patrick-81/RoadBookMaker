@@ -43,6 +43,7 @@ LANGS = {
         "success": "Succès", "routing_done": "Routage terminé !", "routing_error": "Erreur du routage :",
         "no_coast": "Trait de côte indisponible, routage SANS test de terre :", "polar_missing": "Polaire introuvable :",
         "use_as_start": "Utiliser comme départ du routage", "start_updated": "Départ mis à jour — relance le routage",
+        "corridor_lbl": "Couloir : perte max (h) :", "legend_corridor": "Couloir de navigation (perte ≤ {tol:g} h)", "corr_calc_error": "Couloir non calculé :", "corr_unreached": "Couloir non calculé : la route n'atteint pas l'arrivée dans le nombre de pas choisi. Augmente « Nombre de pas » (ou le pas de temps).",
         "legend_track": "Route parcourue", "track_btn": "Trace parcourue…", "track_title": "Trace parcourue",
         "track_summary": "{n} point(s) enregistré(s)  ·  {nm:.0f} NM parcourus", "track_delete": "Supprimer la sélection", "track_clear": "Tout effacer",
         "track_confirm": "Effacer toute la trace enregistrée ?", "track_empty": "Aucun point enregistré. Chaque « Où en suis-je ? » ajoute un point.", "close_btn": "Fermer",
@@ -87,6 +88,7 @@ LANGS = {
         "success": "Success", "routing_done": "Routing complete!", "routing_error": "Routing error:",
         "no_coast": "Coastline unavailable, routing WITHOUT land test:", "polar_missing": "Polar file not found:",
         "use_as_start": "Use as routing start", "start_updated": "Start updated — run the routing again",
+        "corridor_lbl": "Corridor: max loss (h):", "legend_corridor": "Navigation corridor (loss ≤ {tol:g} h)", "corr_calc_error": "Corridor not computed:", "corr_unreached": "Corridor not computed: the route does not reach the finish within the chosen number of steps. Increase the number of steps (or the time step).",
         "legend_track": "Track sailed", "track_btn": "Sailed track…", "track_title": "Sailed track",
         "track_summary": "{n} point(s) recorded  ·  {nm:.0f} NM sailed", "track_delete": "Delete selected", "track_clear": "Clear all",
         "track_confirm": "Clear the whole recorded track?", "track_empty": "No point recorded yet. Each “Where am I?” adds a point.", "close_btn": "Close",
@@ -546,7 +548,7 @@ def locate_on_route(path, step_h, t0, boat, when):
     }
 
 
-def position_report(info, boat, when, details, lang="FR", ref=None):
+def position_report(info, boat, when, details, lang="FR", ref=None, corridor=None):
     """
     Synthèse structurée de « Où en suis-je ? » :
       headline / subline / tone ('ok' | 'late' | 'info') pour le bandeau,
@@ -628,6 +630,10 @@ def position_report(info, boat, when, details, lang="FR", ref=None):
     if status != "before":
         gap_rows.append((L("Tu es au niveau du point", "You are at route point"), L(f"{near}, tu devrais être à {trel(rel_now)}", f"{near}, you should be at {trel(rel_now)}")))
 
+    if corridor:
+        c_in, c_nm = corridor_status(corridor["geom"], boat[0], boat[1])
+        c_txt = L("dans le couloir", "inside the corridor") if c_in else L(f"hors couloir, à {c_nm:.1f} NM du bord", f"outside the corridor, {c_nm:.1f} NM from its edge")
+        gap_rows.append((L("Couloir de navigation", "Navigation corridor"), c_txt + L(f"  (perte ≤ {corridor['tol_h']:g} h)", f"  (loss ≤ {corridor['tol_h']:g} h)")))
     route_rows = []
     if status == "before":
         route_rows.append((L("Point de route le plus proche", "Nearest route point"), near))
@@ -829,6 +835,159 @@ def run_isochrone_routing(polar_path, ds_grib, base_time, start, finish, time_st
     return history_fronts, best_path
 
 
+# ==========================================
+# 3d. COULOIR DE NAVIGATION (zone où la perte de temps reste ≤ tolérance)
+# ==========================================
+def _parse_tol(txt):
+    """Champ « Couloir : perte max (h) » -> float >= 0 (0 = pas de couloir). Accepte la virgule."""
+    try:
+        return max(float(str(txt).strip().replace(",", ".")), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def front_polygon(lats, lons, center):
+    """Polygone d'un front d'isochrone : points triés par azimut autour de `center` (coordonnées lon/lat)."""
+    from shapely.geometry import Polygon
+    lats, lons = np.asarray(lats, dtype=float), np.asarray(lons, dtype=float)
+    if len(lats) < 3:
+        return None
+    brg = np.asarray(compute_bearing(center[0], center[1], lats, lons), dtype=float)
+    order = np.argsort(brg)
+    pts = list(zip(lons[order], lats[order]))
+    # Un front ne couvre souvent qu'un secteur d'angle : sans le centre, le polygone n'est qu'une mince calotte
+    # (arc + corde) et l'intérieur de la zone atteignable est perdu. On ferme donc l'arc par le centre.
+    b_sorted = brg[order]
+    gaps = np.diff(np.concatenate([b_sorted, [b_sorted[0] + 360.0]]))
+    gi = int(np.argmax(gaps))
+    if gaps[gi] > 60.0:
+        pts = pts[gi + 1:] + pts[:gi + 1]
+        pts.append((center[1], center[0]))
+    poly = Polygon(pts)
+    return poly if poly.is_valid else poly.buffer(0)
+
+
+def route_eta_hours(path, polar_path, ds_grib, base_time, finish, time_step_hours, time_offset_hours):
+    """Durée (h, depuis T+000h) jusqu'à l'arrivée sur la route optimale, dernier tronçon partiel inclus. None si non atteinte."""
+    if len(path) < 2 or great_circle_nm(path[-1][0], path[-1][1], finish[0], finish[1]) > 0.5:
+        return None
+    polar, wind = load_polar(polar_path), WindField(ds_grib)
+    n_full = len(path) - 2
+    a = path[-2]
+    when = base_time + timedelta(hours=time_offset_hours + n_full * time_step_hours)
+    tws, twd = wind.get(a[0], a[1], when)
+    hdg = float(compute_bearing(a[0], a[1], finish[0], finish[1]))
+    twa = abs((hdg - float(twd[0]) + 180.0) % 360.0 - 180.0)
+    bsp = float(polar_speed(polar, np.array([twa]), np.array([float(tws[0])]))[0])
+    d = float(great_circle_nm(a[0], a[1], finish[0], finish[1]))
+    return n_full * time_step_hours + d / max(bsp, 0.5)
+
+
+def compute_corridor(polar_path, ds_grib, base_time, start, finish, history_fronts, best_path,
+                     time_step_hours, time_offset_hours, tol_h, heading_step_deg=5, sector_width_deg=1.0,
+                     land_test=None, return_lenses=False):
+    """
+    Couloir = ensemble des positions par lesquelles on peut encore arriver au plus tard à ETA_optimale + tol_h.
+    À chaque pas k : (zone atteignable depuis le départ à t_k) ∩ (zone d'où l'on atteint l'arrivée avant l'échéance).
+      - la première zone est le front d'isochrone aller (déjà calculé) ;
+      - la seconde vient d'un routage INVERSE depuis l'arrivée (même polaire, même vent, mêmes pas de temps).
+    Retourne une géométrie shapely en (lon, lat), ou None si l'arrivée n'a pas été atteinte.
+    """
+    from shapely.geometry import Point, LineString
+    from shapely.ops import unary_union
+    dt = float(time_step_hours)
+    if tol_h <= 0 or len(best_path) < 2:
+        return None
+    eta = route_eta_hours(best_path, polar_path, ds_grib, base_time, finish, dt, time_offset_hours)
+    if eta is None:
+        # Arrivée non atteinte : l'horizon (pas de temps x nombre de pas) fait office de fin de route,
+        # et le dernier point de la route devient l'arrivée « virtuelle » du couloir.
+        finish = (float(best_path[-1][0]), float(best_path[-1][1]))
+        eta = (len(best_path) - 1) * dt
+    polar, wind = load_polar(polar_path), WindField(ds_grib)
+    headings = np.arange(0.0, 360.0, heading_step_deg)
+    f_lat, f_lon = finish
+    s = len(history_fronts) - 1                       # dernier front aller calculé (instant t_s)
+    deadline = eta + tol_h
+    k_end = int(np.floor(deadline / dt))
+    delta0 = deadline - k_end * dt                    # durée partielle du premier pas inverse
+
+    def reverse_step(lats, lons, k_start, dur):
+        """Positions d'où l'on atteint (lats, lons) en `dur` heures en partant à t_k_start (vent lu au point d'arrivée du tronçon)."""
+        t_wind = base_time + timedelta(hours=time_offset_hours + k_start * dt)
+        tws, twd = wind.get(lats, lons, t_wind)
+        twa = np.abs((headings[None, :] - twd[:, None] + 180.0) % 360.0 - 180.0)
+        bsp = polar_speed(polar, twa, tws[:, None])
+        back_hdg = (headings[None, :] + 180.0) % 360.0
+        p_lat, p_lon = destination_point(lats[:, None], lons[:, None], back_hdg, bsp * dur)
+        ok = (bsp > 0.1) & wind.inside(p_lat, p_lon)
+        if land_test is not None:
+            for frac in (0.25, 0.5, 0.75, 1.0):
+                q_lat, q_lon = destination_point(lats[:, None], lons[:, None], back_hdg, bsp * dur * frac)
+                ok &= ~land_test(q_lat, q_lon)
+        c_lat, c_lon = p_lat[ok], p_lon[ok]
+        if c_lat.size == 0:
+            return None
+        d_f = great_circle_nm(f_lat, f_lon, c_lat, c_lon)
+        sector = (compute_bearing(f_lat, f_lon, c_lat, c_lon) // sector_width_deg).astype(int)
+        order = np.lexsort((-d_f, sector))
+        keep = order[np.unique(sector[order], return_index=True)[1]]       # le plus éloigné de l'arrivée par secteur
+        return c_lat[keep], c_lon[keep]
+
+    back = {}
+    cur = (np.array([f_lat]), np.array([f_lon]))
+    if delta0 > 1e-6:
+        nxt = reverse_step(cur[0], cur[1], k_end, delta0)
+        cur = nxt if nxt is not None else cur
+    back[k_end] = cur
+    for k in range(k_end - 1, -1, -1):
+        nxt = reverse_step(cur[0], cur[1], k, dt)
+        if nxt is None:
+            break
+        cur = nxt
+        back[k] = cur
+
+    if return_lenses == 'back':
+        return back
+    eps = 0.04                                        # ≈ 2,4 NM : la route optimale reste toujours dans le couloir
+    lenses = {}
+    for k in range(0, min(s, len(best_path) - 1) + 1):
+        if k not in back:
+            continue
+        pf = history_fronts[k]
+        F = front_polygon([p[0] for p in pf], [p[1] for p in pf], start) if len(pf) >= 3 else None
+        B = front_polygon(back[k][0], back[k][1], finish) if len(back[k][0]) >= 3 else None
+        route_pt = Point(best_path[k][1], best_path[k][0]).buffer(eps)
+        F = F if F is not None else Point(start[1], start[0]).buffer(eps)
+        B = B if B is not None else Point(f_lon, f_lat).buffer(eps)
+        # Le routage inverse perd ~0,3-0,7 NM par pas (bruit de discrétisation des caps et des secteurs) : au début de la route,
+        # cette dérive dépasse la tolérance et le couloir disparaissait. La marge de B croît donc avec le nombre de pas inverses.
+        eps_b = eps + min(0.7 * (k_end - k) / 38.0, 1.5)
+        lens = F.buffer(eps).intersection(B.buffer(eps_b))
+        lenses[k] = unary_union([lens, route_pt]) if not lens.is_empty else route_pt
+
+    ks = sorted(lenses)
+    parts = [lenses[k] for k in ks] + [LineString([(p[1], p[0]) for p in best_path]).buffer(eps)]
+    parts += [unary_union([lenses[a], lenses[b]]).convex_hull for a, b in zip(ks[:-1], ks[1:])]        # pas de trou entre deux pas
+    if ks:
+        parts.append(unary_union([lenses[ks[-1]], Point(f_lon, f_lat).buffer(eps)]).convex_hull)
+    corridor = unary_union(parts).simplify(0.005)
+    return (corridor, lenses) if return_lenses else corridor
+
+
+def corridor_status(geom, lat, lon):
+    """(dans_le_couloir, distance_au_bord_en_NM) pour une position."""
+    from shapely.geometry import Point
+    from shapely import affinity
+    p = Point(lon, lat)
+    if geom.contains(p) or geom.touches(p):
+        return True, 0.0
+    k = np.cos(np.radians(lat)) * 60.0
+    g2 = affinity.scale(geom, xfact=k, yfact=60.0, origin=(0, 0))
+    p2 = affinity.scale(p, xfact=k, yfact=60.0, origin=(0, 0))
+    return False, float(g2.distance(p2))
+
+
 def analyze_route_performance(best_path, ds_grib, base_time, polar_interp, time_step_hours, time_offset_hours=0):
     wind = WindField(ds_grib)
     route_details = []
@@ -855,7 +1014,7 @@ def export_to_gpx(best_path, filename="route_optimale.gpx"):
     with open(filename, 'w', encoding='utf-8') as f: f.write(gpx + '  </trkseg></trk>\n</gpx>')
 
 
-def plot_interactive_routing(history_fronts, best_path, start, finish, theoretical_pos=None, boat_pos=None, next_heading_info="", lang="FR", track=None):
+def plot_interactive_routing(history_fronts, best_path, start, finish, theoretical_pos=None, boat_pos=None, next_heading_info="", lang="FR", track=None, corridor=None):
     t = LANGS[lang]
     fig, ax = plt.subplots(figsize=(12, 7), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.add_feature(cfeature.LAND, facecolor='#e0e0e0', zorder=0)
@@ -868,6 +1027,8 @@ def plot_interactive_routing(history_fronts, best_path, start, finish, theoretic
 
     for front in history_fronts:
         if front: ax.scatter([pt[1] for pt in front], [pt[0] for pt in front], color='lightblue', s=8, alpha=0.4, transform=ccrs.PlateCarree(), zorder=2)
+    if corridor is not None:
+        ax.add_geometries([corridor["geom"]], crs=ccrs.PlateCarree(), facecolor='#c9a9b6', edgecolor='#a67c8e', alpha=0.45, linewidth=1.0, zorder=1.5)
     if best_path:
         ax.plot([pt[1] for pt in best_path], [pt[0] for pt in best_path], color='red', linewidth=2, marker='o', markersize=3, transform=ccrs.PlateCarree(), label=t["legend_opt"], zorder=3)
         
@@ -885,6 +1046,9 @@ def plot_interactive_routing(history_fronts, best_path, start, finish, theoretic
         ax.plot([boat_pos[1], theoretical_pos[1]], [boat_pos[0], theoretical_pos[0]], color='orange', linestyle='--', linewidth=1.5, transform=ccrs.PlateCarree(), zorder=5)
 
     extra = [p for p in (boat_pos, theoretical_pos) if p] + list(track or [])
+    if corridor is not None:
+        bx0, by0, bx1, by1 = corridor["geom"].bounds
+        extra += [(by0, bx0), (by1, bx1)]
     all_lats = [pt[0] for f in history_fronts for pt in f] + [pt[0] for pt in best_path] + [p[0] for p in extra]
     all_lons = [pt[1] for f in history_fronts for pt in f] + [pt[1] for pt in best_path] + [p[1] for p in extra]
     if all_lats and all_lons:
@@ -908,7 +1072,11 @@ def plot_interactive_routing(history_fronts, best_path, start, finish, theoretic
 
     fig.canvas.mpl_connect('button_press_event', on_click)
     plt.title(t["plot_title"])
-    plt.legend(loc='upper right')
+    handles, _labels = ax.get_legend_handles_labels()
+    if corridor is not None:
+        from matplotlib.patches import Patch
+        handles.append(Patch(facecolor='#c9a9b6', edgecolor='#a67c8e', alpha=0.6, label=t["legend_corridor"].format(tol=corridor["tol_h"])))
+    ax.legend(handles=handles, loc='upper right')
     plt.show()
 
 
@@ -1056,7 +1224,7 @@ def run_gui_application():
 
     e_s_lat_deg = e_s_lat_min = e_s_lon_deg = e_s_lon_min = None
     e_f_lat_deg = e_f_lat_min = e_f_lon_deg = e_f_lon_min = None
-    e_timestep = e_steps = e_offset = e_sim_start = tree = None
+    e_timestep = e_steps = e_offset = e_sim_start = tree = e_corr = None
     stored_route_details = []
     stored_route = None      # {'path': [...], 'step': h, 't0': datetime UTC}
     stored_history = []
@@ -1162,7 +1330,7 @@ def run_gui_application():
             tree.selection_set(children[idx])
             tree.see(children[idx])
 
-        report = position_report(info, (cur_lat, cur_lon), when, stored_route_details, current_lang, ref=stored_route)
+        report = position_report(info, (cur_lat, cur_lon), when, stored_route_details, current_lang, ref=stored_route, corridor=stored_route.get("corridor"))
         short = report["short"]
         def use_as_start():
             fill_start_fields(e_s_lat_deg, e_s_lat_min, e_s_lon_deg, e_s_lon_min, s_lat_hemi, s_lon_hemi, e_sim_start, cur_lat, cur_lon, when)
@@ -1172,14 +1340,14 @@ def run_gui_application():
         # La carte est redessinée avec les deux positions (avant, elle était tracée avant la saisie)
         plt.close('all')
         plot_interactive_routing(stored_history, stored_route["path"], stored_route["path"][0], finish_coords,
-                                 theoretical_pos=theo_coords, boat_pos=current_boat_coords, next_heading_info=short, lang=current_lang, track=track_points(track))
+                                 theoretical_pos=theo_coords, boat_pos=current_boat_coords, next_heading_info=short, lang=current_lang, track=track_points(track), corridor=stored_route.get("corridor"))
 
     def exit_application():
         plt.close('all')
         root.destroy()
 
     def build_gui():
-        nonlocal main_container, e_s_lat_deg, e_s_lat_min, e_s_lon_deg, e_s_lon_min, e_f_lat_deg, e_f_lat_min, e_f_lon_deg, e_f_lon_min, e_timestep, e_steps, e_offset, e_sim_start, tree
+        nonlocal main_container, e_s_lat_deg, e_s_lat_min, e_s_lon_deg, e_s_lon_min, e_f_lat_deg, e_f_lat_min, e_f_lon_deg, e_f_lon_min, e_timestep, e_steps, e_offset, e_sim_start, tree, e_corr
         for widget in main_container.winfo_children(): widget.destroy()
 
         current_lang = lang_var.get()
@@ -1281,6 +1449,11 @@ def run_gui_application():
         e_offset.insert(0, str(last_cfg.get("time_offset_hours", 3)))
         e_offset.pack(side=tk.LEFT, padx=5)
 
+        tk.Label(time_frame, text=t["corridor_lbl"]).pack(side=tk.LEFT, padx=(10, 0))
+        e_corr = tk.Entry(time_frame, width=5, justify="center")
+        e_corr.insert(0, str(last_cfg.get("corridor_tol_h", 1.0)))
+        e_corr.pack(side=tk.LEFT, padx=5)
+
         tk.Checkbutton(params_frame, text=t["force_grib"], variable=force_grib_var).pack(anchor="w", padx=10, pady=2)
         tk.Checkbutton(params_frame, text=t["avoid_land"], variable=land_var).pack(anchor="w", padx=10, pady=2)
 
@@ -1313,7 +1486,7 @@ def run_gui_application():
                     "finish_lat_deg": float(e_f_lat_deg.get().strip()), "finish_lat_min": float(e_f_lat_min.get().strip()), "finish_lat_hemi": f_lat_hemi.get(),
                     "finish_lon_deg": float(e_f_lon_deg.get().strip()), "finish_lon_min": float(e_f_lon_min.get().strip()), "finish_lon_hemi": f_lon_hemi.get(),
                     "time_step_hours": t_step, "total_steps": tot_steps, "time_offset_hours": offset_val,
-                    "sim_start_utc": sim_start_str, "language": current_lang, "avoid_land": land_var.get()
+                    "sim_start_utc": sim_start_str, "language": current_lang, "avoid_land": land_var.get(), "corridor_tol_h": _parse_tol(e_corr.get())
                 })
 
                 root.config(cursor="watch"); root.update()
@@ -1328,8 +1501,18 @@ def run_gui_application():
                         messagebox.showwarning(t["error_title"], f"{t['no_coast']}\n{e}")
                 history, optimal_route = run_isochrone_routing(p_file, ds_grib, base_time, (s_lat, s_lon), (f_lat, f_lon), time_step_hours=t_step, total_steps=tot_steps, time_offset_hours=offset_val, land_test=land_test)
                 export_to_gpx(optimal_route, "route_optimale.gpx")
+                corridor = None
+                corr_tol = _parse_tol(e_corr.get())
+                if corr_tol > 0:
+                    try:
+                        geom = compute_corridor(p_file, ds_grib, base_time, (s_lat, s_lon), (f_lat, f_lon), history, optimal_route, t_step, offset_val, corr_tol, land_test=land_test)
+                        corridor = {"geom": geom, "tol_h": corr_tol} if geom is not None else None
+                        if corridor is None:
+                            messagebox.showwarning(t["error_title"], t["corr_unreached"])
+                    except Exception as e:
+                        messagebox.showwarning(t["error_title"], f"{t['corr_calc_error']}\n{e}")
                 stored_route_details = analyze_route_performance(optimal_route, ds_grib, base_time, polar_interp, t_step, time_offset_hours=offset_val)
-                stored_route = {"path": optimal_route, "step": t_step, "t0": base_time, "sim_start": base_time, "offset_h": offset_val}
+                stored_route = {"path": optimal_route, "step": t_step, "t0": base_time, "sim_start": base_time, "offset_h": offset_val, "corridor": corridor}
                 stored_history = history
                 theo_coords = None
 
@@ -1349,7 +1532,7 @@ def run_gui_application():
                 info_texte = (f"Départ: {s_lat:.2f}°, {s_lon:.2f}°\nVitesse Polaire: {bsp_theo:.1f} nds\nVent GFS: {tws_init[0]:.1f} nds du {twd_init[0]:.0f}°" if current_lang == "FR"
                               else f"Start: {s_lat:.2f}°, {s_lon:.2f}°\nPolar speed: {bsp_theo:.1f} kts\nGFS wind: {tws_init[0]:.1f} kts from {twd_init[0]:.0f}°")
                 
-                plot_interactive_routing(history, optimal_route, (s_lat, s_lon), (f_lat, f_lon), theoretical_pos=theo_coords, boat_pos=current_boat_coords, next_heading_info=info_texte, lang=current_lang, track=track_points(load_track()))
+                plot_interactive_routing(history, optimal_route, (s_lat, s_lon), (f_lat, f_lon), theoretical_pos=theo_coords, boat_pos=current_boat_coords, next_heading_info=info_texte, lang=current_lang, track=track_points(load_track()), corridor=corridor)
             except Exception as e:
                 root.config(cursor="")
                 messagebox.showerror(t["error_title"], f"{t['routing_error']}\n{e}")
