@@ -1,0 +1,19 @@
+# --- environnements et caches locaux ---
+.venv/
+__pycache__/
+*.pyc
+
+# --- donnees GRIB (volumineuses, telechargees a la demande) ---
+grib_cache/
+
+# --- caches et sorties d'execution ---
+sailaway_cache.json
+*.gpx
+
+# --- configuration personnelle (positions, trace) ---
+config_routing.json
+config_boat.json
+
+# --- divers ---
+*.bak
+*.log

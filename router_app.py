@@ -12,6 +12,11 @@ import cartopy.feature as cfeature
 import tkinter as tk
 from tkinter import messagebox, ttk, filedialog
 
+try:
+    import sailaway_api                     # meteo reelle du jeu (calage du champ GFS)
+except Exception:                           # module absent : calage simplement desactive
+    sailaway_api = None
+
 CONFIG_FILE = "config_routing.json"
 
 # ==========================================
@@ -34,6 +39,11 @@ LANGS = {
         "time_set_success": "Horodatage de départ verrouillé avec succès à :",
         "force_grib": "Forcer le rafraîchissement des GRIBs (ignorer le cache)",
         "avoid_land": "Éviter la terre (côtes et îles, marge 5 NM)",
+        "auto_cal": "Calibrer la météo sur SA III (API Sailaway)",
+        "calib_window": "Calibrage météo",
+        "calib_done": "Calé sur SA III : offset {off:+.2f} h, échelle {k:.2f}, rotation {rot:+.1f}°, écart {rms:.1f} nds",
+        "calib_fail": "Calibrage impossible (API Sailaway indisponible) — réglages inchangés",
+        "calib_none": "Calibrage Sailaway impossible : aucun point reçu",
         "error_title": "Erreur",
         "params_frame": " Paramètres de Routage ", "polar_lbl": "Polaire:",
         "ok_btn": "Valider", "cancel_btn": "Annuler",
@@ -79,6 +89,11 @@ LANGS = {
         "time_set_success": "Simulation start timestamp successfully locked to:",
         "force_grib": "Force GRIB refresh (ignore cache)",
         "avoid_land": "Avoid land (coasts and islands, 5 NM margin)",
+        "auto_cal": "Calibrate weather on SA III (Sailaway API)",
+        "calib_window": "Weather calibration",
+        "calib_done": "Calibrated on SA III: offset {off:+.2f} h, scale {k:.2f}, rotation {rot:+.1f}°, error {rms:.1f} kts",
+        "calib_fail": "Calibration unavailable (Sailaway API unreachable) — settings unchanged",
+        "calib_none": "Sailaway calibration failed: no point received",
         "error_title": "Error",
         "params_frame": " Routing Parameters ", "polar_lbl": "Polar:",
         "ok_btn": "OK", "cancel_btn": "Cancel",
@@ -222,30 +237,46 @@ def load_polar(filepath):
                                  df.values.astype(float), method='linear', bounds_error=False, fill_value=0.0)
 
 
-def try_download_cycle(lat_min, lat_max, lon_min, lon_max, gfs_cycle_time, max_hours, step_hours, output_dir, force_download):
+def gfs_forecast_hours(max_hours, step_hours=1):
+    """Echeances GFS a telecharger.
+
+    Le GFS 0.25 deg fournit les 10 m **toutes les heures jusqu'a f120**, puis toutes
+    les 3 h jusqu'a f384. Avec step_hours=1 on prend donc f000..f120 a l'heure, et
+    au-dela on complete en tri-horaire pour ne pas demander de fichiers inexistants.
+    """
+    step_hours = max(1, int(step_hours))
+    max_hours = int(max_hours)
+    if step_hours >= 6:
+        return list(range(0, max_hours + 1, step_hours))
+    hours = list(range(0, min(max_hours, 120) + 1, step_hours))
+    if max_hours > 120:
+        hours += list(range(123, max_hours + 1, 3))
+    return hours
+
+
+def _cycle_dir(output_dir, gfs_cycle_time):
+    """Un sous-dossier par cycle : deux runs ne peuvent plus se melanger."""
+    return os.path.join(output_dir, gfs_cycle_time.strftime("%Y%m%d_%H"))
+
+
+def try_download_cycle(lat_min, lat_max, lon_min, lon_max, gfs_cycle_time, hours, output_dir,
+                       force_download, progress=None):
     date_str = gfs_cycle_time.strftime("%Y%m%d")
     cycle_str = f"{gfs_cycle_time.hour:02d}"
-    
-    meta_file = os.path.join(output_dir, "metadata.json")
-    should_download = force_download
-
-    if not should_download and os.path.exists(meta_file):
-        try:
-            with open(meta_file, 'r') as f:
-                meta = json.load(f)
-                if meta.get("cycle") != f"{date_str}_{cycle_str}":
-                    should_download = True
-        except Exception:
-            should_download = True
+    cycle_label = f"cycle {cycle_str}z  " if progress is not None else ""
+    cycle_dir = _cycle_dir(output_dir, gfs_cycle_time)
+    os.makedirs(cycle_dir, exist_ok=True)
 
     downloaded_files = []
-    for f in range(0, max_hours + 1, step_hours):
+    for n, f in enumerate(hours):
+        if progress is not None:
+            progress(n, len(hours), cycle_label)
         f_str = f"f{f:03d}"
-        filename = os.path.join(output_dir, f"gfs_{f_str}.grib")
-        if not should_download and os.path.exists(filename) and os.path.getsize(filename) > 1000:
+        filename = os.path.join(cycle_dir, f"gfs_{f_str}.grib")
+        if not force_download and os.path.exists(filename) and os.path.getsize(filename) > 1000:
             downloaded_files.append(filename)
             continue
-        
+
         params = {
             'file': f'gfs.t{cycle_str}z.pgrb2.0p25.{f_str}',
             'lev_10_m_above_ground': 'on', 'var_UGRD': 'on', 'var_VGRD': 'on',
@@ -253,31 +284,23 @@ def try_download_cycle(lat_min, lat_max, lon_min, lon_max, gfs_cycle_time, max_h
             'bottomlat': lat_min, 'toplat': lat_max, 'dir': f'/gfs.{date_str}/{cycle_str}/atmos'
         }
         try:
-            res = requests.get("https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl", params=params, stream=True, timeout=10)
+            res = requests.get("https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl",
+                               params=params, stream=True, timeout=15)
             if res.status_code == 200 and len(res.content) > 1000:
                 with open(filename, 'wb') as fo:
                     fo.write(res.content)
                 downloaded_files.append(filename)
-            elif os.path.exists(filename) and os.path.getsize(filename) > 1000:
-                downloaded_files.append(filename)
-        except Exception:
-            if os.path.exists(filename) and os.path.getsize(filename) > 1000:
-                downloaded_files.append(filename)
-
-    if not downloaded_files:
-        return None
-
-    if should_download:
-        try:
-            with open(meta_file, 'w') as mf: 
-                json.dump({"cycle": f"{date_str}_{cycle_str}", "last_download": datetime.now(timezone.utc).isoformat()}, mf)
         except Exception:
             pass
+
+    # Cycle incomplet (run encore en cours de publication) : on essaiera le precedent.
+    if len(downloaded_files) < len(hours):
+        return None
 
     datasets = []
     for fn in downloaded_files:
         try:
-            d = xr.open_dataset(fn, engine='cfgrib')
+            d = xr.open_dataset(fn, engine='cfgrib', backend_kwargs={'indexpath': ''})
             # cfgrib : 'time' = heure du cycle (identique pour tous les fichiers), 'valid_time' = heure réelle de la prévision.
             vt = np.atleast_1d(d['valid_time'].values)
             d = d.drop_vars(['time', 'step', 'valid_time'], errors='ignore').expand_dims(time=vt)
@@ -285,7 +308,7 @@ def try_download_cycle(lat_min, lat_max, lon_min, lon_max, gfs_cycle_time, max_h
         except Exception:
             pass
 
-    if not datasets:
+    if len(datasets) < len(hours):
         return None
 
     with xr.set_options(use_new_combine_kwarg_defaults=True):
@@ -294,20 +317,26 @@ def try_download_cycle(lat_min, lat_max, lon_min, lon_max, gfs_cycle_time, max_h
         ds = ds.sortby('time').drop_duplicates(dim='time')
     return ds
 
-def download_gfs_forecast(lat_min, lat_max, lon_min, lon_max, base_time, max_hours=360, step_hours=6, output_dir="grib_cache", force_download=False):
+def download_gfs_forecast(lat_min, lat_max, lon_min, lon_max, base_time, max_hours=360, step_hours=6, output_dir="grib_cache", force_download=False, progress=None):
     os.makedirs(output_dir, exist_ok=True)
     gfs_hour = (base_time.hour // 6) * 6
     gfs_cycle_time = base_time.replace(hour=gfs_hour, minute=0, second=0, microsecond=0)
+    hours = gfs_forecast_hours(max_hours, step_hours)
 
-    ds = try_download_cycle(lat_min, lat_max, lon_min, lon_max, gfs_cycle_time, max_hours, step_hours, output_dir, force_download)
-    if ds is not None:
-        return ds
-
-    for _ in range(3):
+    # Un cycle GFS 0.25 n'est complet (~f120) qu'environ 5 h apres son heure de
+    # reference : on ne tente pas les cycles encore en cours de publication.
+    now = datetime.now(timezone.utc)
+    for _ in range(8):
+        if gfs_cycle_time + timedelta(hours=5) <= now:
+            break
         gfs_cycle_time -= timedelta(hours=6)
-        ds = try_download_cycle(lat_min, lat_max, lon_min, lon_max, gfs_cycle_time, max_hours, step_hours, output_dir, force_download)
+
+    for _ in range(4):
+        ds = try_download_cycle(lat_min, lat_max, lon_min, lon_max, gfs_cycle_time, hours,
+                                output_dir, force_download, progress)
         if ds is not None:
             return ds
+        gfs_cycle_time -= timedelta(hours=6)
 
     raise RuntimeError(f"Impossible de télécharger les fichiers GRIB GFS.\nVérifiez votre connexion internet.")
 
@@ -339,6 +368,89 @@ def destination_point(lat, lon, hdg, dist_nm):
     lmb2 = lmb1 + np.arctan2(np.sin(theta) * np.sin(delta) * np.cos(phi1), np.cos(delta) - np.sin(phi1) * np.sin(phi2))
     return np.degrees(phi2), (np.degrees(lmb2) + 540.0) % 360.0 - 180.0
 
+# ---- Calage du champ GFS sur la meteo reelle du jeu (voir sailaway_api.py) ----
+# Applique au vent GFS : facteur d'echelle puis rotation du vecteur vent.
+_CALIB = {"scale": 1.0, "rot_deg": 0.0}
+
+
+def set_calibration(scale=1.0, rot_deg=0.0):
+    """Facteur d'echelle et rotation (degres, sens trigonometrique) du vent GFS.
+
+    Une rotation positive fait tourner le vecteur vent vers la gauche, donc TWD
+    diminue d'autant. Remettre (1.0, 0.0) desactive le calage.
+    """
+    _CALIB["scale"] = float(scale)
+    _CALIB["rot_deg"] = float(rot_deg)
+
+
+def get_calibration():
+    return dict(_CALIB)
+
+
+# WindField(ds) est instancie plusieurs fois par run (routage, roadbook, couloir,
+# ETA) : sans cache, 120 echeances seraient recopiees ~5 fois (~90 Mo par copie).
+# On garde donc les tableaux tant que le dataset est le meme objet.
+_WIND_CACHE = {}
+
+class WindField:
+    def __init__(self, ds):
+        cached = _WIND_CACHE.get("last")
+        if cached is not None and cached[0] is ds:
+            (self.lat, self.lon, self.times, self.u, self.v, self.lon360) = cached[1]
+            return
+        self.lat = np.asarray(ds.latitude.values, dtype=float)
+        self.lon = np.asarray(ds.longitude.values, dtype=float)
+        times = np.asarray(ds.time.values).astype('datetime64[s]')
+        order = np.argsort(times)
+        self.times = times[order]
+        self.u = ds['u10'].transpose('time', 'latitude', 'longitude').values[order]
+        self.v = ds['v10'].transpose('time', 'latitude', 'longitude').values[order]
+        self.lon360 = self.lon.max() > 180.0
+        _WIND_CACHE["last"] = (ds, (self.lat, self.lon, self.times, self.u, self.v, self.lon360))
+
+    def get(self, lat, lon, when):
+        lat = np.atleast_1d(np.asarray(lat, dtype=float))
+        lon = np.atleast_1d(np.asarray(lon, dtype=float))
+        if self.lon360: lon = lon % 360.0
+        if when.tzinfo is not None: when = when.replace(tzinfo=None)
+        t = np.datetime64(when, 's')
+        n = len(self.times)
+        i1 = int(np.clip(np.searchsorted(self.times, t), 0, n - 1))
+        i0 = max(i1 - 1, 0)
+        t0, t1 = self.times[i0], self.times[i1]
+        w = 0.0 if t1 == t0 else float(np.clip((t - t0) / (t1 - t0), 0.0, 1.0))
+        ilat = np.abs(self.lat[:, None] - lat[None, :]).argmin(axis=0)
+        ilon = np.abs(self.lon[:, None] - lon[None, :]).argmin(axis=0)
+        u = (1 - w) * self.u[i0, ilat, ilon] + w * self.u[i1, ilat, ilon]
+        v = (1 - w) * self.v[i0, ilat, ilon] + w * self.v[i1, ilat, ilon]
+
+        # --- calage sur la meteo mesuree dans le jeu (sailaway_api) ---
+        if _CALIB["scale"] != 1.0 or _CALIB["rot_deg"]:
+            th = np.radians(_CALIB["rot_deg"])
+            ct, st = np.cos(th), np.sin(th)
+            u, v = _CALIB["scale"] * (u * ct - v * st), _CALIB["scale"] * (u * st + v * ct)
+        
+        # --- MODIFICATION : Application de la réduction dynamique de couche limite ---
+        # 1. Calcul du vent brut GFS à 10m en nœuds
+        tws_10m = np.hypot(u, v) * 1.94384
+        
+        # 2. Modèle empirique progressif (la mer freine d'autant plus qu'elle est creusée par le vent)
+        penalty = 0.001
+        reduction_factor = 1.0 - np.clip(0.02 + penalty * tws_10m, 0.03, 0.15)
+        tws_surface = tws_10m * reduction_factor
+        
+        # 3. Calcul de la direction (TWD) inchangée
+        twd = (270.0 - np.degrees(np.arctan2(v, u))) % 360.0
+        
+        return tws_surface, twd
+
+    def inside(self, lat, lon, tol=0.25):
+        lat, lon = np.asarray(lat, dtype=float), np.asarray(lon, dtype=float)
+        if self.lon360: lon = lon % 360.0
+        return (lat >= self.lat.min() - tol) & (lat <= self.lat.max() + tol) & (lon >= self.lon.min() - tol) & (lon <= self.lon.max() + tol)
+
+
+'''
 class WindField:
     def __init__(self, ds):
         self.lat = np.asarray(ds.latitude.values, dtype=float)
@@ -371,6 +483,60 @@ class WindField:
         lat, lon = np.asarray(lat, dtype=float), np.asarray(lon, dtype=float)
         if self.lon360: lon = lon % 360.0
         return (lat >= self.lat.min() - tol) & (lat <= self.lat.max() + tol) & (lon >= self.lon.min() - tol) & (lon <= self.lon.max() + tol)
+'''
+def fit_calibration(field, obs, now, offsets=None, step_h=0.25):
+    """Ajuste (offset temporel, facteur d'echelle, rotation) du champ GFS sur des mesures.
+
+    field : WindField du GFS
+    obs   : liste de (lat, lon, tws_kt, twd_deg) mesurees dans le jeu a l'instant 'now'
+    Retourne dict(offset_h, scale, rot_deg, rms) ou None.
+    """
+    if not obs:
+        return None
+    if offsets is None:
+        offsets = np.arange(-8.0, 8.001, step_h)
+    saved = get_calibration()
+    set_calibration(1.0, 0.0)                 # l'ajustement part du champ brut
+    best = None
+    try:
+        for off in offsets:
+            gu, gv, ou, ov = [], [], [], []
+            ok = True
+            for lat, lon, tws_o, twd_o in obs:
+                tws, twd = field.get(lat, lon, now + timedelta(hours=float(off)))
+                t_g = float(np.ravel(tws)[0])
+                d_g = float(np.ravel(twd)[0])
+                if not (np.isfinite(t_g) and np.isfinite(d_g) and t_g > 0.1):
+                    ok = False
+                    break
+                rg = np.radians(270.0 - d_g)
+                ro = np.radians(270.0 - float(twd_o))
+                gu.append(t_g * np.cos(rg))
+                gv.append(t_g * np.sin(rg))
+                ou.append(float(tws_o) * np.cos(ro))
+                ov.append(float(tws_o) * np.sin(ro))
+            if not ok:
+                continue
+            gu, gv = np.asarray(gu), np.asarray(gv)
+            ou, ov = np.asarray(ou), np.asarray(ov)
+            norm = float(np.sum(gu * gu + gv * gv))
+            if norm <= 0:
+                continue
+            a = float(np.sum(gu * ou + gv * ov))       # k.cos(theta)
+            b = float(np.sum(gu * ov - gv * ou))       # k.sin(theta)
+            k = float(np.hypot(a, b) / norm)
+            th = float(np.arctan2(b, a))
+            pu = k * (gu * np.cos(th) - gv * np.sin(th))
+            pv = k * (gu * np.sin(th) + gv * np.cos(th))
+            rms = float(np.sqrt(np.mean((pu - ou) ** 2 + (pv - ov) ** 2)))
+            if best is None or rms < best[0]:
+                best = (rms, float(off), k, float(np.degrees(th)))
+    finally:
+        set_calibration(saved["scale"], saved["rot_deg"])
+    if best is None:
+        return None
+    rms, off, k, rot = best
+    return {"offset_h": off, "scale": k, "rot_deg": rot, "rms": rms}
 
 def polar_speed(polar_interp, twa, tws):
     twa_grid, tws_grid = polar_interp.grid
@@ -1100,7 +1266,8 @@ def load_last_config():
         "finish_lon_deg": 61, "finish_lon_min": 31.8, "finish_lon_hemi": "W",
         "time_step_hours": 3, "total_steps": 150, "time_offset_hours": 3,
         "sim_start_utc": default_base,
-        "language": "FR", "force_grib": False, "avoid_land": True
+        "language": "FR", "force_grib": False, "avoid_land": True, "auto_calibrate": True,
+        "grib_step_hours": 1
     }
 
 def save_config(cfg):
@@ -1202,6 +1369,42 @@ def show_track_manager(parent, lang="FR"):
     parent.wait_window(win)
 
 
+class GribProgress:
+    """Petite fenetre de progression pendant le telechargement GRIB.
+
+    Le telechargement se fait dans le thread Tk (bloquant) : on rafraichit donc
+    l'affichage avec update_idletasks(), sans traiter d'evenements utilisateur.
+    """
+
+    def __init__(self, parent, title="Prevision meteo", label="GRIB"):
+        self.label = label
+        self.win = tk.Toplevel(parent)
+        self.win.title(title)
+        self.win.geometry("400x100")
+        self.win.transient(parent)
+        self.win.resizable(False, False)
+        self.lbl = tk.Label(self.win, text="Preparation de la meteo...", font=("Arial", 9))
+        self.lbl.pack(padx=14, pady=(16, 6))
+        self.bar = ttk.Progressbar(self.win, orient="horizontal", length=360, mode="determinate")
+        self.bar.pack(padx=14, pady=(0, 14))
+        self.win.update_idletasks()
+
+    def __call__(self, done, total, cycle=""):
+        try:
+            self.bar["maximum"] = max(int(total), 1)
+            self.bar["value"] = done
+            self.lbl.config(text=f"{cycle}{self.label} : {done}/{total}")
+            self.win.update_idletasks()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
 def run_gui_application():
     last_cfg = load_last_config()
     root = tk.Tk()
@@ -1213,6 +1416,7 @@ def run_gui_application():
     polar_path_var = tk.StringVar(value=last_cfg.get("polar_file", "imoca_polar.csv"))
     force_grib_var = tk.BooleanVar(value=False)
     land_var = tk.BooleanVar(value=last_cfg.get("avoid_land", True))
+    calib_var = tk.BooleanVar(value=bool(last_cfg.get("auto_calibrate", True)))
 
     s_lat_hemi = tk.StringVar(value=last_cfg.get("start_lat_hemi", "N"))
     s_lon_hemi = tk.StringVar(value=last_cfg.get("start_lon_hemi", "W"))
@@ -1253,7 +1457,7 @@ def run_gui_application():
                 messagebox.showinfo("Confirmation", f"{t['time_set_success']}\n{val_fixed}")
             except Exception as e:
                 messagebox.showerror(t["error_title"], f"{t['bad_datetime']}\n{e}")
-
+    '''
     def import_sailaway_gps():
         nonlocal e_s_lat_deg, e_s_lat_min, e_s_lon_deg, e_s_lon_min, s_lat_hemi, s_lon_hemi
         current_lang = lang_var.get()
@@ -1286,6 +1490,33 @@ def run_gui_application():
         e_s_lon_min.delete(0, tk.END); e_s_lon_min.insert(0, f"{lon_m:.2f}")
         
         messagebox.showinfo("GPS Sailaway", f"{LANGS[current_lang]['gps_updated']}\nLat: {lat_d}° {lat_m:.2f}' {s_lat_hemi.get()}\nLon: {lon_d}° {lon_m:.2f}' {s_lon_hemi.get()}")
+    '''
+
+    def import_sailaway_gps():
+        nonlocal e_s_lat_deg, e_s_lat_min, e_s_lon_deg, e_s_lon_min, s_lat_hemi, s_lon_hemi, e_sim_start
+        current_lang = lang_var.get()
+        
+        # Récupérer les valeurs actuelles des champs si l'utilisateur y a déjà mis des chiffres
+        try:
+            cur_lat_approx = (float(e_s_lat_deg.get().strip()) + float(e_s_lat_min.get().strip()) / 60.0) * (-1 if s_lat_hemi.get() == "S" else 1)
+            cur_lon_approx = (float(e_s_lon_deg.get().strip()) + float(e_s_lon_min.get().strip()) / 60.0) * (-1 if s_lon_hemi.get() == "W" else 1)
+        except Exception:
+            cur_lat_approx, cur_lon_approx = 50.61, -14.21
+
+        # ask_time=True pour afficher et saisir l'heure UTC dans la popup
+        dialog = BoatPosDialog(root, default_lat=cur_lat_approx, default_lon=cur_lon_approx, lang=current_lang, ask_time=True)
+        root.wait_window(dialog)
+        if dialog.result is None: return
+
+        lat, lon = dialog.result
+        when = dialog.when_utc or datetime.now(timezone.utc)
+        
+        # Remplit à la fois les coordonnées et le champ e_sim_start de la fenêtre principale
+        fill_start_fields(e_s_lat_deg, e_s_lat_min, e_s_lon_deg, e_s_lon_min, s_lat_hemi, s_lon_hemi, e_sim_start, lat, lon, when)
+        
+        lat_d, lat_m = split_dm(lat)
+        lon_d, lon_m = split_dm(lon)
+        messagebox.showinfo("GPS Sailaway", f"{LANGS[current_lang]['gps_updated']}\nLat: {lat_d}° {lat_m:.2f}' {s_lat_hemi.get()}\nLon: {lon_d}° {lon_m:.2f}' {s_lon_hemi.get()}\nUTC: {when.strftime('%Y-%m-%d %H:%M:%S')}")
 
     def locate_current_position():
         nonlocal current_boat_coords, theo_coords
@@ -1456,6 +1687,7 @@ def run_gui_application():
 
         tk.Checkbutton(params_frame, text=t["force_grib"], variable=force_grib_var).pack(anchor="w", padx=10, pady=2)
         tk.Checkbutton(params_frame, text=t["avoid_land"], variable=land_var).pack(anchor="w", padx=10, pady=2)
+        tk.Checkbutton(params_frame, text=t["auto_cal"], variable=calib_var).pack(anchor="w", padx=10, pady=2)
 
         actions_frame = tk.Frame(params_frame)
         actions_frame.pack(fill="x", padx=10, pady=5)
@@ -1479,6 +1711,7 @@ def run_gui_application():
                     base_time = datetime.strptime(sim_start_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
                     sim_start_str = base_time.strftime("%Y-%m-%d %H:%M:%S")
 
+                grib_step = int(last_cfg.get("grib_step_hours", 1) or 1)
                 save_config({
                     "polar_file": p_file,
                     "start_lat_deg": float(e_s_lat_deg.get().strip()), "start_lat_min": float(e_s_lat_min.get().strip()), "start_lat_hemi": s_lat_hemi.get(),
@@ -1486,11 +1719,49 @@ def run_gui_application():
                     "finish_lat_deg": float(e_f_lat_deg.get().strip()), "finish_lat_min": float(e_f_lat_min.get().strip()), "finish_lat_hemi": f_lat_hemi.get(),
                     "finish_lon_deg": float(e_f_lon_deg.get().strip()), "finish_lon_min": float(e_f_lon_min.get().strip()), "finish_lon_hemi": f_lon_hemi.get(),
                     "time_step_hours": t_step, "total_steps": tot_steps, "time_offset_hours": offset_val,
-                    "sim_start_utc": sim_start_str, "language": current_lang, "avoid_land": land_var.get(), "corridor_tol_h": _parse_tol(e_corr.get())
+                    "sim_start_utc": sim_start_str, "language": current_lang, "avoid_land": land_var.get(),
+                    "auto_calibrate": bool(calib_var.get()),
+                    "corridor_tol_h": _parse_tol(e_corr.get()), "grib_step_hours": grib_step
                 })
 
                 root.config(cursor="watch"); root.update()
-                ds_grib = download_gfs_forecast(12.0, 55.0, -68.0, 0.0, base_time, max_hours=t_step * tot_steps + abs(offset_val) + 12, step_hours=6, force_download=force_grib_var.get())
+                max_h = int(t_step * tot_steps + abs(offset_val) + 12)
+                prog = GribProgress(root, "Prévision météo" if current_lang == "FR" else "Weather download")
+                try:
+                    ds_grib = download_gfs_forecast(12.0, 55.0, -68.0, 0.0, base_time,
+                                                    max_hours=max_h, step_hours=grib_step,
+                                                    force_download=force_grib_var.get(),
+                                                    progress=prog)
+                finally:
+                    prog.close()
+
+                # --- calage sur la meteo reelle du jeu (API Sailaway) ----------
+                calib_txt = None
+                if not calib_var.get():
+                    set_calibration(1.0, 0.0)       # calage desactive : on repart du GFS brut
+                if calib_var.get() and sailaway_api is not None:
+                    prog_c = GribProgress(root, t["calib_window"], label="SA III")
+                    try:
+                        grid = sailaway_api.get_grid(s_lat, s_lon, span_deg=0.5, step_deg=0.5,
+                                                     progress=lambda i, n: prog_c(i, n, ""))
+                    finally:
+                        prog_c.close()
+                    if grid and grid.get("points"):
+                        obs = [(q["lat"], q["lon"], q["tws_kt"], q["twd_deg"]) for q in grid["points"]]
+                        set_calibration(1.0, 0.0)
+                        fit = fit_calibration(WindField(ds_grib), obs, datetime.now(timezone.utc))
+                        if fit is not None:
+                            offset_val = fit["offset_h"]
+                            set_calibration(fit["scale"], fit["rot_deg"])
+                            e_offset.delete(0, tk.END); e_offset.insert(0, f"{offset_val:g}")
+                            cfg_cal = load_last_config()
+                            cfg_cal["time_offset_hours"] = offset_val
+                            save_config(cfg_cal)
+                            calib_txt = t["calib_done"].format(off=offset_val, k=fit["scale"],
+                                                               rot=fit["rot_deg"], rms=fit["rms"])
+                    if calib_txt is None:
+                        calib_txt = t["calib_none"]
+
                 polar_interp = load_polar(p_file)
                 
                 land_test = None
@@ -1512,6 +1783,8 @@ def run_gui_application():
                     except Exception as e:
                         messagebox.showwarning(t["error_title"], f"{t['corr_calc_error']}\n{e}")
                 stored_route_details = analyze_route_performance(optimal_route, ds_grib, base_time, polar_interp, t_step, time_offset_hours=offset_val)
+                if calib_txt:
+                    results_frame.config(text=t["results_title"] + "   —   " + calib_txt)
                 stored_route = {"path": optimal_route, "step": t_step, "t0": base_time, "sim_start": base_time, "offset_h": offset_val, "corridor": corridor}
                 stored_history = history
                 theo_coords = None

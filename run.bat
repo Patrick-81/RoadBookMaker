@@ -42,6 +42,7 @@ REM 4. Copy source files to installation directory
 echo [INFO] Copying application files...
 copy /Y "router_app.py" "%TARGET_DIR%\" >nul
 copy /Y "imoca_polar.csv" "%TARGET_DIR%\" >nul 2>&1
+copy /Y "sailaway_api.py" "%TARGET_DIR%\" >nul 2>&1
 if exist "requirements.txt" copy /Y "requirements.txt" "%TARGET_DIR%\" >nul
 if exist "uninstall.bat" copy /Y "uninstall.bat" "%TARGET_DIR%\" >nul
 if exist "%~nx0" copy /Y "%~nx0" "%TARGET_DIR%\" >nul
