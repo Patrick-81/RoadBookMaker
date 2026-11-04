@@ -1703,7 +1703,9 @@ def run_gui_application():
                 f_lat = (float(e_f_lat_deg.get().strip()) + float(e_f_lat_min.get().strip()) / 60.0) * (-1 if f_lat_hemi.get() == "S" else 1)
                 f_lon = (float(e_f_lon_deg.get().strip()) + float(e_f_lon_min.get().strip()) / 60.0) * (-1 if f_lon_hemi.get() == "W" else 1)
 
-                finish_coords, t_step, tot_steps, offset_val = (f_lat, f_lon), int(e_timestep.get().strip()), int(e_steps.get().strip()), int(e_offset.get().strip())
+                finish_coords, t_step, tot_steps = (f_lat, f_lon), int(e_timestep.get().strip()), int(e_steps.get().strip())
+                # le calage automatique ecrit un decalage decimal (ex. -4.5) : ne pas arrondir a l'entier
+                offset_val = float(str(e_offset.get()).strip().replace(",", "."))
                 sim_start_str = e_sim_start.get().strip()
                 try:
                     base_time = datetime.strptime(sim_start_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
