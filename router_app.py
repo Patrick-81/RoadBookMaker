@@ -62,7 +62,7 @@ LANGS = {
         "exit_btn": "🚪 Sortie",
         "error_title": "Erreur",
         "results_title": "Feuille de Route Optimisée (Roadbook)",
-        "col_utc": "UTC", "col_local": "Heure solaire", "col_hour": "Échéance", "col_lat": "Latitude", "col_lon": "Longitude", 
+        "col_utc": "UTC", "col_local": "Heure solaire", "col_hour": "Échéance", "col_lat": "Latitude", "col_lon": "Longitude", "col_hdg": "Cap (°)",
         "col_tws": "TWS (nds)", "col_twd": "TWD (°)", "col_twa": "TWA (°)", "col_bsp": "BSP (nds)",
         "arrival": "ARRIVÉE",
         "plot_title": "Routage Météo - Navigation Interactive",
@@ -111,7 +111,7 @@ LANGS = {
         "where_btn": "📍 Where am I?",
         "exit_btn": "🚪 Exit",
         "results_title": "Optimized Roadbook",
-        "col_utc": "UTC", "col_local": "Solar time", "col_hour": "Elapsed", "col_lat": "Latitude", "col_lon": "Longitude", 
+        "col_utc": "UTC", "col_local": "Solar time", "col_hour": "Elapsed", "col_lat": "Latitude", "col_lon": "Longitude", "col_hdg": "Course (°)",
         "col_tws": "TWS (kts)", "col_twd": "TWD (°)", "col_twa": "TWA (°)", "col_bsp": "BSP (kts)",
         "arrival": "ARRIVAL",
         "plot_title": "Weather Routing - Interactive Navigation",
@@ -1793,10 +1793,10 @@ def run_gui_application():
 
                 for row in tree.get_children(): tree.delete(row)
                 for rd in stored_route_details:
-                    tree.insert("", tk.END, values=(rd['utc'], rd['local'], f"T+{rd['hour']:03d}h", f"{rd['lat']:.2f}°", f"{rd['lon']:.2f}°", f"{rd['tws']:.1f}", f"{rd['twd']:.0f}°", f"{rd['twa']:.0f}°", f"{rd['bsp']:.1f}"))
+                    tree.insert("", tk.END, values=(rd['utc'], rd['local'], f"T+{rd['hour']:03d}h", f"{rd['lat']:.2f}°", f"{rd['lon']:.2f}°", f"{rd['hdg']:.0f}°", f"{rd['tws']:.1f}", f"{rd['twd']:.0f}°", f"{rd['twa']:.0f}°", f"{rd['bsp']:.1f}"))
                 if stored_route_details:
                     last = stored_route_details[-1]
-                    tree.insert("", tk.END, values=("-", "-", t["arrival"], f"{last['lat']:.2f}°", f"{last['lon']:.2f}°", "-", "-", "-", "-"))
+                    tree.insert("", tk.END, values=("-", "-", t["arrival"], f"{last['lat']:.2f}°", f"{last['lon']:.2f}°", "-", "-", "-", "-", "-"))
 
                 root.config(cursor="")
                 messagebox.showinfo(t["success"], t["routing_done"])
@@ -1820,18 +1820,19 @@ def run_gui_application():
         results_frame = tk.LabelFrame(main_container, text=t["results_title"], font=("Arial", 10, "bold"))
         results_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        cols = ("utc", "local", "hour", "lat", "lon", "tws", "twd", "twa", "bsp")
+        cols = ("utc", "local", "hour", "lat", "lon", "hdg", "tws", "twd", "twa", "bsp")
         tree = ttk.Treeview(results_frame, columns=cols, show="headings", height=8)
         for col in cols: tree.heading(col, text=t[f"col_{col}"])
-        tree.column("utc", width=140, anchor="center")
-        tree.column("local", width=140, anchor="center")
-        tree.column("hour", width=75, anchor="center")
-        tree.column("lat", width=80, anchor="center")
-        tree.column("lon", width=80, anchor="center")
-        tree.column("tws", width=75, anchor="center")
-        tree.column("twd", width=70, anchor="center")
-        tree.column("twa", width=70, anchor="center")
-        tree.column("bsp", width=75, anchor="center")
+        tree.column("utc", width=138, anchor="center")
+        tree.column("local", width=138, anchor="center")
+        tree.column("hour", width=72, anchor="center")
+        tree.column("lat", width=76, anchor="center")
+        tree.column("lon", width=76, anchor="center")
+        tree.column("hdg", width=65, anchor="center")
+        tree.column("tws", width=70, anchor="center")
+        tree.column("twd", width=64, anchor="center")
+        tree.column("twa", width=64, anchor="center")
+        tree.column("bsp", width=70, anchor="center")
 
         scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
