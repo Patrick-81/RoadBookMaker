@@ -44,6 +44,10 @@ LANGS = {
         "calib_done": "Calé sur SA III : offset {off:+.2f} h, échelle {k:.2f}, rotation {rot:+.1f}°, écart {rms:.1f} nds",
         "calib_fail": "Calibrage impossible (API Sailaway indisponible) — réglages inchangés",
         "calib_none": "Calibrage Sailaway impossible : aucun point reçu",
+        "calib_clamped": "(échelle brute {raw:.2f} bornée à {k:.2f}, correction locale sur {radius} NM)",
+        "calib_offset_rejected": "(décalage {best:+.2f} h non retenu : accord insuffisant {rms:.1f} nd, offset 0 appliqué)",
+        "calib_weak": "ATTENTION : champ peu fiable autour du bateau (écart {rms:.1f} nd) — route à prendre avec prudence",
+        "time_drift": "ATTENTION : heure de début décalée de {min:+.0f} min par rapport à l'heure réelle — tout le routage est lu au mauvais moment",
         "error_title": "Erreur",
         "params_frame": " Paramètres de Routage ", "polar_lbl": "Polaire:",
         "ok_btn": "Valider", "cancel_btn": "Annuler",
@@ -94,6 +98,10 @@ LANGS = {
         "calib_done": "Calibrated on SA III: offset {off:+.2f} h, scale {k:.2f}, rotation {rot:+.1f}°, error {rms:.1f} kts",
         "calib_fail": "Calibration unavailable (Sailaway API unreachable) — settings unchanged",
         "calib_none": "Sailaway calibration failed: no point received",
+        "calib_clamped": "(raw scale {raw:.2f} clamped to {k:.2f}, local correction over {radius} NM)",
+        "calib_offset_rejected": "(shift {best:+.2f} h rejected: poor fit {rms:.1f} kts, offset 0 applied)",
+        "calib_weak": "WARNING: unreliable field around the boat ({rms:.1f} kts error) — use the route with care",
+        "time_drift": "WARNING: simulation start is {min:+.0f} min away from real time — the whole route reads the wrong hour",
         "error_title": "Error",
         "params_frame": " Routing Parameters ", "polar_lbl": "Polar:",
         "ok_btn": "OK", "cancel_btn": "Cancel",
@@ -369,22 +377,49 @@ def destination_point(lat, lon, hdg, dist_nm):
     return np.degrees(phi2), (np.degrees(lmb2) + 540.0) % 360.0 - 180.0
 
 # ---- Calage du champ GFS sur la meteo reelle du jeu (voir sailaway_api.py) ----
-# Applique au vent GFS : facteur d'echelle puis rotation du vecteur vent.
-_CALIB = {"scale": 1.0, "rot_deg": 0.0}
+# Le biais est mesure sur une grille de +/-0.5 deg autour du bateau : il ne vaut
+# pas a 1000 NM de la. L'echelle et la rotation decroissent donc avec la distance
+# (gaussienne de largeur CALIB_SIGMA_NM) ; seul le decalage temporel reste global.
+CALIB_MAX_DEV = 0.10          # echelle bornee a [0.90, 1.10]
+CALIB_MAX_ROT = 10.0          # rotation bornee a +/-10 deg
+CALIB_SIGMA_NM = 250.0        # portee spatiale du calage
+CALIB_MAX_OFFSET_H = 3.0      # au-dela, ce n'est plus un retard mais un mauvais ajustement
+CALIB_MIN_GAIN = 0.75         # l'offset doit reduire l'erreur d'au moins 25 %
+CALIB_MAX_RMS = 1.5           # accord minimal exige pour appliquer un decalage (nds)
+CALIB_RMS_WARN = 2.0          # au-dela : champ peu fiable autour du bateau
+
+_CALIB = {"scale": 1.0, "rot_deg": 0.0, "lat": None, "lon": None, "sigma_nm": CALIB_SIGMA_NM}
 
 
-def set_calibration(scale=1.0, rot_deg=0.0):
+def set_calibration(scale=1.0, rot_deg=0.0, lat=None, lon=None, sigma_nm=CALIB_SIGMA_NM):
     """Facteur d'echelle et rotation (degres, sens trigonometrique) du vent GFS.
 
     Une rotation positive fait tourner le vecteur vent vers la gauche, donc TWD
-    diminue d'autant. Remettre (1.0, 0.0) desactive le calage.
+    diminue d'autant. lat/lon = ou le biais a ete mesure : la correction decroit
+    autour de ce point. Remettre (1.0, 0.0) desactive le calage.
     """
     _CALIB["scale"] = float(scale)
     _CALIB["rot_deg"] = float(rot_deg)
+    _CALIB["lat"] = None if lat is None else float(lat)
+    _CALIB["lon"] = None if lon is None else float(lon)
+    _CALIB["sigma_nm"] = float(sigma_nm)
 
 
 def get_calibration():
     return dict(_CALIB)
+
+
+def _calib_factors(lat, lon):
+    """(echelle, rotation en radians) effectives au point demande, avec decroissance."""
+    k = _CALIB["scale"]
+    rot = _CALIB["rot_deg"]
+    if k == 1.0 and rot == 0.0:
+        return 1.0, 0.0
+    if _CALIB["lat"] is None:
+        return k, np.radians(rot)
+    d = great_circle_nm(_CALIB["lat"], _CALIB["lon"], lat, lon)
+    w = np.exp(-0.5 * (d / max(_CALIB["sigma_nm"], 1.0)) ** 2)
+    return 1.0 + (k - 1.0) * w, np.radians(rot) * w
 
 
 # WindField(ds) est instancie plusieurs fois par run (routage, roadbook, couloir,
@@ -426,9 +461,9 @@ class WindField:
 
         # --- calage sur la meteo mesuree dans le jeu (sailaway_api) ---
         if _CALIB["scale"] != 1.0 or _CALIB["rot_deg"]:
-            th = np.radians(_CALIB["rot_deg"])
+            kk, th = _calib_factors(lat, lon)      # decroit loin du point de mesure
             ct, st = np.cos(th), np.sin(th)
-            u, v = _CALIB["scale"] * (u * ct - v * st), _CALIB["scale"] * (u * st + v * ct)
+            u, v = kk * (u * ct - v * st), kk * (u * st + v * ct)
         
         # --- MODIFICATION : Application de la réduction dynamique de couche limite ---
         # 1. Calcul du vent brut GFS à 10m en nœuds
@@ -494,10 +529,12 @@ def fit_calibration(field, obs, now, offsets=None, step_h=0.25):
     if not obs:
         return None
     if offsets is None:
-        offsets = np.arange(-8.0, 8.001, step_h)
+        offsets = [round(x, 3) for x in np.arange(-8.0, 8.001, step_h)]
+    if not any(abs(o) < 1e-9 for o in offsets):
+        offsets = list(offsets) + [0.0]
     saved = get_calibration()
     set_calibration(1.0, 0.0)                 # l'ajustement part du champ brut
-    best = None
+    results = {}
     try:
         for off in offsets:
             gu, gv, ou, ov = [], [], [], []
@@ -524,19 +561,35 @@ def fit_calibration(field, obs, now, offsets=None, step_h=0.25):
                 continue
             a = float(np.sum(gu * ou + gv * ov))       # k.cos(theta)
             b = float(np.sum(gu * ov - gv * ou))       # k.sin(theta)
-            k = float(np.hypot(a, b) / norm)
-            th = float(np.arctan2(b, a))
+            k_raw = float(np.hypot(a, b) / norm)
+            th_raw = float(np.arctan2(b, a))
+            # bornes de securite : un biais mesure sur 60 NM ne doit pas etre
+            # extrapole a tout l'ocean
+            k = float(np.clip(k_raw, 1.0 - CALIB_MAX_DEV, 1.0 + CALIB_MAX_DEV))
+            th = float(np.clip(th_raw, -np.radians(CALIB_MAX_ROT), np.radians(CALIB_MAX_ROT)))
             pu = k * (gu * np.cos(th) - gv * np.sin(th))
             pv = k * (gu * np.sin(th) + gv * np.cos(th))
             rms = float(np.sqrt(np.mean((pu - ou) ** 2 + (pv - ov) ** 2)))
-            if best is None or rms < best[0]:
-                best = (rms, float(off), k, float(np.degrees(th)))
+            results[float(off)] = (rms, k, float(np.degrees(th)), k_raw, float(np.degrees(th_raw)))
     finally:
-        set_calibration(saved["scale"], saved["rot_deg"])
-    if best is None:
+        set_calibration(saved["scale"], saved["rot_deg"], lat=saved.get("lat"),
+                        lon=saved.get("lon"), sigma_nm=saved.get("sigma_nm", CALIB_SIGMA_NM))
+    if not results:
         return None
-    rms, off, k, rot = best
-    return {"offset_h": off, "scale": k, "rot_deg": rot, "rms": rms}
+    off_best = min(results, key=lambda o: results[o][0])
+    rms_best = results[off_best][0]
+    rms_zero = results.get(0.0, (float("inf"),))[0]
+    # Garde-fou : un decalage temporel n'est retenu que s'il ameliore NETTEMENT
+    # l'accord et que l'accord final est bon. Sinon on sur-ajuste un champ a fort
+    # gradient et on route sur une prevision deplacee de plusieurs heures.
+    keep = (abs(off_best) <= CALIB_MAX_OFFSET_H
+            and rms_best <= CALIB_MIN_GAIN * rms_zero
+            and rms_best <= CALIB_MAX_RMS)
+    off_sel = off_best if keep else 0.0
+    rms, k, rot, k_raw, rot_raw = results[off_sel]
+    return {"offset_h": off_sel, "scale": k, "rot_deg": rot, "rms": rms,
+            "scale_raw": k_raw, "rot_raw": rot_raw,
+            "offset_best": off_best, "offset_kept": keep, "rms_zero": rms_zero}
 
 def polar_speed(polar_interp, twa, tws):
     twa_grid, tws_grid = polar_interp.grid
@@ -1754,13 +1807,29 @@ def run_gui_application():
                         fit = fit_calibration(WindField(ds_grib), obs, datetime.now(timezone.utc))
                         if fit is not None:
                             offset_val = fit["offset_h"]
-                            set_calibration(fit["scale"], fit["rot_deg"])
+                            # echelle/rotation locales autour du bateau ; offset global
+                            set_calibration(fit["scale"], fit["rot_deg"], lat=s_lat, lon=s_lon)
                             e_offset.delete(0, tk.END); e_offset.insert(0, f"{offset_val:g}")
                             cfg_cal = load_last_config()
                             cfg_cal["time_offset_hours"] = offset_val
                             save_config(cfg_cal)
                             calib_txt = t["calib_done"].format(off=offset_val, k=fit["scale"],
                                                                rot=fit["rot_deg"], rms=fit["rms"])
+                            if abs(fit["scale_raw"] - 1.0) > CALIB_MAX_DEV + 1e-9:
+                                calib_txt += "   " + t["calib_clamped"].format(
+                                    raw=fit["scale_raw"], k=fit["scale"], radius=int(CALIB_SIGMA_NM))
+                            if not fit["offset_kept"]:
+                                calib_txt += "   " + t["calib_offset_rejected"].format(
+                                    best=fit["offset_best"], rms=fit["rms_zero"])
+                            if fit["rms"] > CALIB_RMS_WARN:
+                                calib_txt += "   " + t["calib_weak"].format(rms=fit["rms"])
+
+                    # l'heure de simulation doit coller a l'heure reelle, sinon tout le
+                    # routage est lu au mauvais moment (le calage, lui, est fait a l'instant present)
+                    drift_min = (datetime.now(timezone.utc) - base_time).total_seconds() / 60.0
+                    if abs(drift_min) > 30:
+                        calib_txt = ((calib_txt + "   ") if calib_txt else "") + \
+                            t["time_drift"].format(min=drift_min)
                     if calib_txt is None:
                         calib_txt = t["calib_none"]
 
